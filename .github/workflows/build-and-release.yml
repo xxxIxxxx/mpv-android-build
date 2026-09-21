@@ -1,0 +1,159 @@
+name: Build and Release mpv-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'mpv-android git ref or tag (default: master)'
+        required: false
+        default: 'master'
+      release_tag:
+        description: 'Custom release tag (optional, e.g. 2026.09.16)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 2 * * 0' # Weekly every Sunday at 02:00 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Clone mpv-android upstream
+        run: |
+          REF="${{ github.event.inputs.upstream_ref }}"
+          [ -z "$REF" ] && REF="master"
+          echo "Cloning mpv-android at ref $REF..."
+          git clone --depth 1 --branch "$REF" https://github.com/mpv-android/mpv-android.git upstream
+          echo "UPSTREAM_COMMIT=$(git -C upstream rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Enable x86 architectures
+        run: |
+          cd upstream
+          # 上游 ci.sh 硬编码 v_ci_archs="armv7l arm64"，只构建 arm；放开为全部
+          # 4 个架构，使 install（依赖编译）与 build（mpv 编译）都覆盖 x86 / x86_64
+          sed -i 's/^v_ci_archs=.*/v_ci_archs="armv7l arm64 x86 x86_64"/' buildscripts/include/ci.sh
+
+      - name: Export env vars
+        run: |
+          cd upstream
+          buildscripts/include/ci.sh export >> $GITHUB_ENV
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: upstream/gh-cache/
+          # 前缀使旧版仅含 arm 依赖的缓存不命中，强制为 4 个架构重编依赖
+          key: "x86x64-${{ env.CACHE_IDENTIFIER }}"
+          enableCrossOsArchive: true
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf pkgconf libtool ninja-build python3-pip gperf nasm zip
+          sudo pip3 install --break-system-packages meson
+
+      - name: Download SDK and build deps
+        run: |
+          cd upstream
+          mkdir -p "$CACHE_FOLDER"
+          buildscripts/include/ci.sh install
+        env:
+          CACHE_MODE: "folder"
+          CACHE_FOLDER: "${{ github.workspace }}/upstream/gh-cache"
+
+      - name: Build mpv native libraries
+        run: |
+          cd upstream
+          buildscripts/include/ci.sh build
+
+      - name: Package native libraries
+        run: |
+          mkdir -p dist/arm64-v8a dist/armeabi-v7a dist/x86 dist/x86_64
+
+          # libmpv.so 为动态链接构建（DT_NEEDED 含 libavcodec/libavformat 等 FFmpeg
+          # 配套库），只打包 libmpv.so 会让消费端 dlopen 因依赖无法解析而失败，
+          # 因此连同 prefix lib 下的全部运行时动态库一并打包。
+          # arm64-v8a
+          if [ -d upstream/prefix/arm64/lib ]; then
+            find upstream/prefix/arm64/lib -maxdepth 1 -name '*.so' -exec cp {} dist/arm64-v8a/ \;
+          elif [ -d upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/arm64-v8a ]; then
+            find upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/arm64-v8a -maxdepth 1 -name '*.so' ! -name 'libplayer.so' -exec cp {} dist/arm64-v8a/ \;
+          fi
+
+          # armeabi-v7a
+          if [ -d upstream/prefix/armv7l/lib ]; then
+            find upstream/prefix/armv7l/lib -maxdepth 1 -name '*.so' -exec cp {} dist/armeabi-v7a/ \;
+          elif [ -d upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/armeabi-v7a ]; then
+            find upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/armeabi-v7a -maxdepth 1 -name '*.so' ! -name 'libplayer.so' -exec cp {} dist/armeabi-v7a/ \;
+          fi
+
+          # x86
+          if [ -d upstream/prefix/x86/lib ]; then
+            find upstream/prefix/x86/lib -maxdepth 1 -name '*.so' -exec cp {} dist/x86/ \;
+          elif [ -d upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/x86 ]; then
+            find upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/x86 -maxdepth 1 -name '*.so' ! -name 'libplayer.so' -exec cp {} dist/x86/ \;
+          fi
+
+          # x86_64
+          if [ -d upstream/prefix/x86_64/lib ]; then
+            find upstream/prefix/x86_64/lib -maxdepth 1 -name '*.so' -exec cp {} dist/x86_64/ \;
+          elif [ -d upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/x86_64 ]; then
+            find upstream/app/build/intermediates/stripped_native_libs/defaultDebug/stripDefaultDebugDebugSymbols/out/lib/x86_64 -maxdepth 1 -name '*.so' ! -name 'libplayer.so' -exec cp {} dist/x86_64/ \;
+          fi
+
+          # 依赖闭环校验：libmpv.so 的每个 DT_NEEDED 项要么在同目录打包产物中，
+          # 要么是 Android 系统公开库，否则直接失败，杜绝再产出残缺包。
+          SYSTEM_LIBS='libm.so|libz.so|libdl.so|libc.so|libandroid.so|liblog.so|libOpenSLES.so|libEGL.so|libGLESv2.so|libmediandk.so|libc++_shared.so'
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            for lib in $(readelf -d "dist/$abi/libmpv.so" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+              if ! echo "$lib" | grep -qE "^($SYSTEM_LIBS)$" && [ ! -f "dist/$abi/$lib" ]; then
+                echo "❌ dist/$abi 缺少 libmpv.so 的依赖库: $lib"; exit 1
+              fi
+            done
+          done
+          echo "✅ 依赖闭环校验通过"
+
+          ls -lh dist/*
+
+          tar -czvf mpv-android-libs.tar.gz -C dist arm64-v8a armeabi-v7a x86 x86_64
+          cd dist && zip -r ../mpv-android-libs.zip arm64-v8a armeabi-v7a x86 x86_64 && cd ..
+
+      - name: Determine Release Tag
+        id: tag
+        run: |
+          INPUT_TAG="${{ github.event.inputs.release_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            TAG_NAME="$INPUT_TAG"
+          else
+            TAG_NAME="build-$(date +'%Y%m%d')-${{ env.UPSTREAM_COMMIT }}"
+          fi
+          echo "release_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: "mpv-android ${{ steps.tag.outputs.release_tag }}"
+          body: |
+            Automated build for `mpv-android` (commit ${{ env.UPSTREAM_COMMIT }}).
+            Contains precompiled `libmpv.so` and its runtime shared library dependencies
+            (FFmpeg etc.) for Android (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`).
+          files: |
+            mpv-android-libs.tar.gz
+            mpv-android-libs.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -45,6 +45,14 @@ jobs:
           # 4 个架构，使 install（依赖编译）与 build（mpv 编译）都覆盖 x86 / x86_64
           sed -i 's/^v_ci_archs=.*/v_ci_archs="armv7l arm64 x86 x86_64"/' buildscripts/include/ci.sh
 
+      - name: Enable ByteVC2 support via librempeg
+        run: |
+          cd upstream
+          # 1. 将 FFmpeg 上游替换为 librempeg (原生内置 bvc2 解码器、cbs 与 isom tags 支持)
+          sed -i 's|git clone https://github.com/FFmpeg/FFmpeg ffmpeg.*|git clone --depth=1 https://github.com/librempeg/librempeg.git ffmpeg|' buildscripts/include/download-deps.sh
+          # 2. 将 depinfo 标识更新为 librempeg，使 ci_tarball 与官方 FFmpeg 隔离，防止旧缓存污染
+          sed -i 's/^v_ci_ffmpeg=.*/v_ci_ffmpeg="librempeg"/' buildscripts/include/depinfo.sh
+
       - name: Export env vars
         run: |
           cd upstream
@@ -54,8 +62,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: upstream/gh-cache/
-          # 前缀使旧版仅含 arm 依赖的缓存不命中，强制为 4 个架构重编依赖
-          key: "x86x64-${{ env.CACHE_IDENTIFIER }}"
+          # 升级前缀为 bvc2-x86x64，确保不命中缺少 bytevc2 的旧依赖缓存
+          key: "bvc2-x86x64-${{ env.CACHE_IDENTIFIER }}"
           enableCrossOsArchive: true
 
       - name: Install build tools
@@ -147,7 +155,7 @@ jobs:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           name: "mpv-android ${{ steps.tag.outputs.release_tag }}"
           body: |
-            Automated build for `mpv-android` (commit ${{ env.UPSTREAM_COMMIT }}).
+            Automated build for `mpv-android` (commit ${{ env.UPSTREAM_COMMIT }}) with ByteVC2 (bvc2) decoder support (via `librempeg`).
             Contains precompiled `libmpv.so` and its runtime shared library dependencies
             (FFmpeg etc.) for Android (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`).
           files: |

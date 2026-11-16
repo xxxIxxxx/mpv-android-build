@@ -48,10 +48,20 @@ jobs:
       - name: Enable ByteVC2 support via librempeg
         run: |
           cd upstream
-          # 1. 将 FFmpeg 上游替换为 librempeg (原生内置 bvc2 解码器、cbs 与 isom tags 支持)
-          sed -i 's|git clone https://github.com/FFmpeg/FFmpeg ffmpeg.*|git clone --depth=1 https://github.com/librempeg/librempeg.git ffmpeg|' buildscripts/include/download-deps.sh
-          # 2. 将 depinfo 标识更新为 librempeg，使 ci_tarball 与官方 FFmpeg 隔离，防止旧缓存污染
-          sed -i 's/^v_ci_ffmpeg=.*/v_ci_ffmpeg="librempeg"/' buildscripts/include/depinfo.sh
+          # 1. 预拉取 librempeg 稳定提交 0ada1735571528a47634d19d213d28eb49e01285
+          # 注意：librempeg 最新 master 于 2026-09-25 (commit ac8be5e) 移除了 libswresample，
+          # 导致 mpv meson 构建报 Dependency libswresample not found；锁定在前一个完备 commit，
+          # 既完整包含 libswresample 又包含 bvc2 (ByteVC2) 解码器与 CBS 管道。
+          mkdir -p buildscripts/deps/ffmpeg
+          cd buildscripts/deps/ffmpeg
+          git init
+          git remote add origin https://github.com/librempeg/librempeg.git
+          git fetch --depth 1 origin 0ada1735571528a47634d19d213d28eb49e01285
+          git checkout FETCH_HEAD
+          cd ../../..
+
+          # 2. 将 depinfo 标识更新为 librempeg-0ada173，使 ci_tarball 与官方 FFmpeg 隔离，防止旧缓存污染
+          sed -i 's/^v_ci_ffmpeg=.*/v_ci_ffmpeg="librempeg-0ada173"/' buildscripts/include/depinfo.sh
 
       - name: Export env vars
         run: |
